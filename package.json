@@ -1,0 +1,12 @@
+{
+  "name": "gift-v5",
+  "version": "1.0.0",
+  "description": "生日礼物网页 v5 —— 短链 + 图片存储后端（零依赖 Node）",
+  "main": "app.js",
+  "scripts": {
+    "start": "node app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

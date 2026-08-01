@@ -1,0 +1,601 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>生日礼物 · v5</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script crossorigin src="react.production.min.js"></script>
+  <script crossorigin src="react-dom.production.min.js"></script>
+  <script src="lz-string.min.js"></script>
+  <script src="babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+    const { useState, useEffect, useRef } = React;
+
+    /* ============ 常量 & 配置 ============ */
+    const DEFAULT_FRIEND = '姚凯杭';
+
+    // 账号密码（硬编码，纯前端验证）—— 已统一为拼音
+    const ACCOUNTS = {
+      'hang0821': { password: 'hang0821', role: 'friend' }, // 朋友：姚凯杭
+      'xin0627':  { password: 'xin0627',  role: 'admin'  }, // 管理员：路欣
+    };
+
+    const K_GIFTS    = 'gift_picker_gifts_v5';
+    const K_SESSION  = 'gift_picker_session_v5';
+    const K_SELECT   = 'gift_picker_selection_v5';
+    const K_EDITUSED = 'gift_picker_edit_used_v5';
+
+    // 飞书同步：非阻塞、失败静默——不依赖飞书，网站照常运行。
+    // 填入 aily 平台事件 webhook 地址后，朋友提交会自动给路欣发飞书消息。
+    const AILY_EVENT_URL = '';
+
+    const DEFAULT_GIFTS = [
+      { id: 1, name: '【占位】无线蓝牙耳机', price: 299, platform: 'jd',     platformLabel: '京东',   imageUrl: '', linkUrl: 'https://www.jd.com',          isPlaceholder: true },
+      { id: 2, name: '【占位】机械键盘',     price: 359, platform: 'taobao', platformLabel: '淘宝',   imageUrl: '', linkUrl: 'https://www.taobao.com',       isPlaceholder: true },
+      { id: 3, name: '【占位】游戏手柄',     price: 199, platform: 'pdd',    platformLabel: '拼多多', imageUrl: '', linkUrl: 'https://www.pinduoduo.com',   isPlaceholder: true },
+    ];
+
+    /* ============ 工具函数 ============ */
+    function getShareId() {
+      const m = window.location.pathname.match(/\/g\/([A-Za-z0-9]+)/);
+      if (m) return m[1];
+      const params = new URLSearchParams(window.location.search);
+      return params.get('g') || '';
+    }
+
+    function stagePrefix() {
+      const seg = window.location.pathname.split('/')[1];
+      return (seg === 'release' || seg === 'test' || seg === 'prepub') ? '/' + seg : '';
+    }
+
+    function getFriendName() {
+      // 优先取分享链接里打包的名字（#d=），其次 ?for=，最后默认
+      const p = decodePayload();
+      if (p && p.friendName) return p.friendName;
+      const params = new URLSearchParams(window.location.search);
+      const n = params.get('for') || params.get('name');
+      return n ? decodeURIComponent(n) : DEFAULT_FRIEND;
+    }
+
+    // 把礼物数据用 LZ 压缩成短串，放进 URL 片段 #d= （不进 query，微信更安全）
+    // withImages=false 时，链接里不带图片 -> 链接很短；朋友看到精美占位卡片
+    function encodeGifts(gifts, friendName, withImages) {
+      // 只打包朋友需要看到的字段(id, 名称, 图片)；价格/链接/平台是管理员专属，不放进链接
+      const payload = {
+        n: friendName,
+        g: gifts.map(g => ({
+          id: g.id,
+          n: g.name,
+          img: withImages ? (g.imageUrl || '') : '',
+        })),
+      };
+      const compressed = LZString.compressToEncodedURIComponent(JSON.stringify(payload));
+      const baseUrl = window.location.origin + window.location.pathname;
+      return baseUrl + '#d=' + compressed;
+    }
+
+    // 从 URL 片段还原打包的数据（含礼物列表 + 朋友显示名）
+    function decodePayload() {
+      const hash = window.location.hash || '';
+      const m = hash.match(/[#&]d=([^&]+)/);
+      if (!m) return null;
+      try {
+        const json = LZString.decompressFromEncodedURIComponent(m[1]);
+        if (!json) return null;
+        const data = JSON.parse(json);
+        if (data && Array.isArray(data.g) && data.g.length) {
+          return {
+            friendName: data.n || DEFAULT_FRIEND,
+            gifts: data.g.map(g => ({ id: g.id, name: g.n, imageUrl: g.img || '', isPlaceholder: !g.img })),
+          };
+        }
+      } catch (e) {
+        console.error('解码礼物数据失败:', e);
+      }
+      return null;
+    }
+
+    function loadGifts() {
+      const p = decodePayload();
+      if (p) {
+        localStorage.setItem(K_GIFTS, JSON.stringify(p.gifts));
+        return p.gifts;
+      }
+      const cached = localStorage.getItem(K_GIFTS);
+      if (cached) {
+        try { const a = JSON.parse(cached); if (Array.isArray(a) && a.length) return a; } catch (e) {}
+      }
+      return DEFAULT_GIFTS;
+    }
+
+    function loadSelection() {
+      try { return JSON.parse(localStorage.getItem(K_SELECT) || 'null'); }
+      catch (e) { return null; }
+    }
+
+    function canEditAddress() {
+      const selection = loadSelection();
+      if (!selection || !selection.submitted) return false;          // 未提交不能改
+      const editUsed = parseInt(localStorage.getItem(K_EDITUSED) || '0');
+      if (editUsed >= 1) return false;                                // 已改过 1 次
+      const params = new URLSearchParams(window.location.search);
+      return params.get('edit') === '1';                             // 需 URL 带 &edit=1
+    }
+
+    // 非阻塞、失败静默：飞书同步不参与主流程
+    function notifyLuxin(payload) {
+      try {
+        if (AILY_EVENT_URL) {
+          fetch(AILY_EVENT_URL, {
+            method: 'POST',
+            mode: 'no-cors',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }).catch(() => {});
+        }
+        // 方式 C：若运行在妙搭宿主内，通知宿主触发
+        if (window.parent && window.parent !== window) {
+          window.parent.postMessage({ type: 'gift_submitted', payload }, '*');
+        }
+      } catch (e) { /* 静默 */ }
+    }
+
+    // 复制文本：优先现代 Clipboard API，失败回退 execCommand（兼容 iframe / 非安全上下文）
+    function copyText(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch (e) { /* 继续走兜底 */ }
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return ok;
+      } catch (e) { return false; }
+    }
+
+    /* ============ 图标 ============ */
+    const GiftIcon = ({ size = 80 }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.4">
+        <rect x="3" y="8" width="18" height="13" rx="1.5" />
+        <path d="M3 12h18M12 8v13" />
+        <path d="M12 8C12 5 10 3 8 3 6 3 5 5 5 6c0 2 4 2 7 2zM12 8c0-3 2-5 4-5 2 0 3 2 3 3 0 2-4 2-7 2z" />
+      </svg>
+    );
+    const CakeIcon = ({ size = 26 }) => (
+      <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+        <path d="M5 21h14M6 21v-7a2 2 0 0 1 2-2h8a2 2 0 0 1 2 2v7M12 12v-3M9 9V6M15 9V6" />
+        <circle cx="9" cy="4.5" r="1" /><circle cx="15" cy="4.5" r="1" /><circle cx="12" cy="8.5" r="1" />
+      </svg>
+    );
+    const UserIcon = () => (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+        <circle cx="12" cy="8" r="4" /><path d="M4 21c0-4 4-6 8-6s8 2 8 6" />
+      </svg>
+    );
+    const LockIcon = () => (
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+        <rect x="5" y="11" width="14" height="9" rx="2" /><path d="M8 11V8a4 4 0 0 1 8 0v3" />
+      </svg>
+    );
+    const ExitIcon = () => (
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6">
+        <path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 8l-4 4 4 4M6 12h11" />
+      </svg>
+    );
+
+    /* ============ 登录页 ============ */
+    function LoginPage({ onLogin }) {
+      const [user, setUser] = useState('');
+      const [pwd, setPwd] = useState('');
+      const [err, setErr] = useState('');
+
+      const submit = () => {
+        const u = user.trim();
+        const acc = ACCOUNTS[u];
+        if (!acc || acc.password !== pwd) { setErr('账号或密码错误'); return; }
+        localStorage.setItem(K_SESSION, JSON.stringify({ username: u, role: acc.role, loginAt: Date.now() }));
+        onLogin(acc.role);
+      };
+
+      return (
+        <div className="login-wrap">
+          <div className="login-card">
+            <h1>你好，请登录</h1>
+            <div className="login-field">
+              <UserIcon />
+              <input placeholder="账号" value={user} onChange={e => setUser(e.target.value)} />
+            </div>
+            <div className="login-field">
+              <LockIcon />
+              <input type="password" placeholder="密码" value={pwd}
+                     onChange={e => setPwd(e.target.value)}
+                     onKeyDown={e => e.key === 'Enter' && submit()} />
+            </div>
+            <button className="login-btn" onClick={submit}>登 录</button>
+            <div className="login-error">{err}</div>
+          </div>
+        </div>
+      );
+    }
+
+    /* ============ 朋友视图 ============ */
+    function FriendPage({ friendName: initName, onLogout }) {
+      const [gifts, setGifts] = useState(() => loadGifts());
+      const [friendName, setFriendName] = useState(initName);
+      const [selection, setSelection] = useState(() => loadSelection());
+      const [selectedId, setSelectedId] = useState(selection ? selection.selectedGiftId : null);
+      const [addr, setAddr] = useState(selection && selection.address ? selection.address : { name: '', phone: '', region: '', detail: '' });
+      const [submitting, setSubmitting] = useState(false);
+      const [toast, setToast] = useState('');
+      const [editing, setEditing] = useState(false);
+
+      // 若通过短链 /g/:id 打开，从后端拉取真实数据（含图片）
+      useEffect(() => {
+        const id = getShareId();
+        if (!id) return;
+        fetch(stagePrefix() + '/api/get?id=' + encodeURIComponent(id))
+          .then(r => (r.ok ? r.json() : null))
+          .then(d => {
+            if (d && Array.isArray(d.gifts) && d.gifts.length) {
+              setGifts(d.gifts.map(g => ({
+                id: g.id, name: g.name,
+                imageUrl: (g.imageUrl && g.imageUrl.startsWith('/img/')) ? window.location.origin + g.imageUrl : (g.imageUrl || ''),
+                isPlaceholder: !g.imageUrl,
+              })));
+              if (d.friendName) setFriendName(d.friendName);
+            }
+          })
+          .catch(() => {});
+      }, []);
+
+      const submitted = !!(selection && selection.submitted);
+      const showEditBtn = submitted && canEditAddress() && !editing;
+
+      const showToast = (t) => { setToast(t); setTimeout(() => setToast(''), 1800); };
+
+      const choose = (id) => {
+        if (submitted || selectedId) return;
+        setSelectedId(id);
+      };
+
+      const submit = () => {
+        if (!selectedId) return;
+        if (!addr.name || !addr.phone || !addr.region || !addr.detail) {
+          showToast('请填写完整的收货信息'); return;
+        }
+        if (!/^1\d{10}$/.test(addr.phone)) { showToast('请输入 11 位手机号'); return; }
+        setSubmitting(true);
+        const gift = gifts.find(g => g.id === selectedId);
+        const payload = {
+          giftId: selectedId,
+          giftName: gift ? gift.name : '',
+          name: addr.name, phone: addr.phone, region: addr.region, address: addr.detail,
+          timestamp: new Date().toISOString(),
+        };
+        // 非阻塞飞书同步（失败不影响主流程）
+        notifyLuxin(payload);
+
+        const newSel = {
+          selectedGiftId: selectedId,
+          selectedGiftName: gift ? gift.name : '',
+          address: addr, submitted: true, submittedAt: Date.now(),
+        };
+        if (editing) localStorage.setItem(K_EDITUSED, '1');
+        localStorage.setItem(K_SELECT, JSON.stringify(newSel));
+        setSelection(newSel);
+        setEditing(false);
+        setSubmitting(false);
+        showToast('已记录');
+      };
+
+      const startEdit = () => { setEditing(true); };
+
+      /* ---- 已提交（含改地址态） ---- */
+      if (submitted && !editing) {
+        const gift = gifts.find(g => g.id === (selection.selectedGiftId));
+        return (
+          <div>
+            <TopBar friendName={friendName} onLogout={onLogout} />
+            <div className="page">
+              <Hero friendName={friendName} />
+              <div className="success-banner">
+                <div className="check">✓</div>
+                <div className="big">已记录</div>
+                <div className="sub2">对方不会看到你的地址</div>
+                {gift && <div className="sub2" style={{marginTop: 10}}>已选：{gift.name}</div>}
+                {showEditBtn
+                  ? <button className="edit-btn" onClick={startEdit}>修改地址</button>
+                  : <div className="sub2" style={{marginTop: 14, color: 'var(--navy-light)'}}>地址已锁定，如需修改请联系路欣</div>}
+              </div>
+            </div>
+            {toast && <div className="toast">{toast}</div>}
+          </div>
+        );
+      }
+
+      /* ---- 未提交 / 修改中 ---- */
+      return (
+        <div>
+          <TopBar friendName={friendName} onLogout={onLogout} />
+          <div className="page">
+            <Hero friendName={friendName} />
+            <div className="gift-grid">
+              {gifts.map(g => {
+                const isSel = selectedId === g.id;
+                const locked = submitted || (selectedId && !isSel);
+                return (
+                  <div key={g.id} className={'gift-card' + (isSel ? ' selected' : '') + (locked ? ' locked' : '')}>
+                    <div className="gift-img">
+                      {g.imageUrl
+                        ? <img src={g.imageUrl} alt={g.name} />
+                        : <div className="placeholder"><GiftIcon size={80} /><div style={{marginTop: 6}}>图片占位</div></div>}
+                      <svg className="ribbon" viewBox="0 0 100 75"><path d="M50 0V75M0 37.5H100" stroke="#3B7DD8" strokeWidth="2" /></svg>
+                    </div>
+                    <div className="gift-body">
+                      <h3>{g.name}</h3>
+                      {isSel ? (
+                        <button className="choose-btn chosen" disabled>✓ 已选中</button>
+                      ) : (
+                        <button className="choose-btn" disabled={locked} onClick={() => choose(g.id)}>选这个</button>
+                      )}
+                      <div className="gift-foot">对方不会看到你的地址</div>
+                    </div>
+                    {isSel && (
+                      <div style={{padding: '0 16px 16px'}}>
+                        <AddrForm addr={addr} setAddr={setAddr} submitting={submitting} onSubmit={submit} />
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+          {toast && <div className="toast">{toast}</div>}
+        </div>
+      );
+    }
+
+    function AddrForm({ addr, setAddr, submitting, onSubmit }) {
+      const set = (k, v) => setAddr({ ...addr, [k]: v });
+      return (
+        <div className="addr-form">
+          <div className="row">
+            <label>姓名</label>
+            <input value={addr.name} onChange={e => set('name', e.target.value)} placeholder="收货人姓名" />
+          </div>
+          <div className="row">
+            <label>电话</label>
+            <input value={addr.phone} onChange={e => set('phone', e.target.value.replace(/\D/g, '').slice(0, 11))} placeholder="11 位手机号" inputMode="numeric" />
+          </div>
+          <div className="row">
+            <label>省市区</label>
+            <input value={addr.region} onChange={e => set('region', e.target.value)} placeholder="如：广东省深圳市南山区" />
+          </div>
+          <div className="row">
+            <label>详细地址</label>
+            <textarea value={addr.detail} onChange={e => set('detail', e.target.value)} placeholder="街道、门牌号等" />
+          </div>
+          <div className="privacy">对方不会看到你的地址</div>
+          <button className="submit-btn" disabled={submitting} onClick={onSubmit}>
+            {submitting ? '提交中...' : '提交'}
+          </button>
+        </div>
+      );
+    }
+
+    function TopBar({ friendName, onLogout }) {
+      return (
+        <div className="topbar">
+          <div className="title">{friendName} 生日快乐</div>
+          <button className="logout" onClick={onLogout} title="退出登录"><ExitIcon /></button>
+        </div>
+      );
+    }
+
+    function Hero({ friendName }) {
+      return (
+        <div className="hero">
+          <div className="deco"><span className="line" /><CakeIcon /><span className="line" /></div>
+          <div className="greet">嗨，{friendName} ~</div>
+          <div className="big">生日快乐</div>
+          <div className="sub">天天开心</div>
+          <div className="label"><span className="line" />选一个你喜欢的<span className="line" /></div>
+        </div>
+      );
+    }
+
+    /* ============ 管理页 ============ */
+    function AdminPage({ onLogout }) {
+      const [gifts, setGifts] = useState(() => {
+        const cached = localStorage.getItem(K_GIFTS);
+        if (cached) { try { const a = JSON.parse(cached); if (Array.isArray(a) && a.length) return a; } catch (e) {} }
+        return DEFAULT_GIFTS;
+      });
+      const [longUrl, setLongUrl] = useState('');
+      const [preview, setPreview] = useState(false);
+      const [toast, setToast] = useState('');
+      const [withImages, setWithImages] = useState(false);
+      const friendName = getFriendName();
+
+      const showToast = (t) => { setToast(t); setTimeout(() => setToast(''), 1800); };
+
+      const update = (id, patch) => setGifts(gs => gs.map(g => g.id === id ? { ...g, ...patch } : g));
+      const removeGift = (id) => {
+        if (gifts.length <= 1) { showToast('至少保留 1 个礼物'); return; }
+        setGifts(gs => gs.filter(g => g.id !== id));
+      };
+      const addGift = () => {
+        const maxId = gifts.reduce((m, g) => Math.max(m, g.id), 0);
+        setGifts(gs => [...gs, { id: maxId + 1, name: '', price: 0, platform: 'jd', platformLabel: '京东', linkUrl: '', imageUrl: '', isPlaceholder: true }]);
+      };
+      // 上传图片时压缩：限制最大边 + JPEG 降质，避免 base64 撑爆 localStorage / 链接过长
+      const onImg = (id, e) => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        if (!file.type.startsWith('image/')) { showToast('请选择图片文件'); return; }
+        const reader = new FileReader();
+        reader.onload = ev => {
+          const img = new Image();
+          img.onload = () => {
+            const MAX = 420;
+            let { width, height } = img;
+            if (width > MAX || height > MAX) {
+              const r = Math.min(MAX / width, MAX / height);
+              width = Math.round(width * r); height = Math.round(height * r);
+            }
+            try {
+              const canvas = document.createElement('canvas');
+              canvas.width = width; canvas.height = height;
+              canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+              update(id, { imageUrl: canvas.toDataURL('image/jpeg', 0.65), isPlaceholder: false });
+            } catch (err) {
+              update(id, { imageUrl: ev.target.result, isPlaceholder: false });
+            }
+          };
+          img.onerror = () => update(id, { imageUrl: ev.target.result, isPlaceholder: false });
+          img.src = ev.target.result;
+        };
+        reader.readAsDataURL(file);
+      };
+
+      const save = () => {
+        try {
+          localStorage.setItem(K_GIFTS, JSON.stringify(gifts));
+          showToast('已保存到本机');
+        } catch (e) {
+          showToast('本机保存失败(图片过大)，直接点“生成长链接”即可分享');
+        }
+      };
+      const gen = async () => {
+        try {
+          const res = await fetch(stagePrefix() + '/api/store', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              friendName,
+              gifts: gifts.map(g => ({ id: g.id, name: g.name, imageUrl: g.imageUrl || '' })),
+            }),
+          });
+          if (res.ok) {
+            const r = await res.json();
+            const url = window.location.origin + stagePrefix() + r.url;   // 形如 https://域名/g/xxxxxx（含 API 网关 stage）
+            setLongUrl(url);
+            showToast('已生成短链接（朋友打开即看到礼物和图片）');
+            try { localStorage.setItem(K_GIFTS, JSON.stringify(gifts)); } catch (e) {}
+            return;
+          }
+        } catch (e) { /* 走兜底 */ }
+        // 兜底：后端不可用时用离线 #d= 链接（按开关决定是否带图）
+        const u = encodeGifts(gifts, friendName, withImages);
+        setLongUrl(u);
+        showToast('在线存储不可用，已生成离线链接');
+        try { localStorage.setItem(K_GIFTS, JSON.stringify(gifts)); } catch (e) {}
+      };
+      const copy = () => {
+        if (!longUrl) return;
+        const ok = copyText(longUrl);
+        showToast(ok ? '链接已复制！' : '已选中，请手动复制 (Ctrl/⌘+C)');
+      };
+      const downloadLink = () => {
+        if (!longUrl) return;
+        const blob = new Blob([longUrl], { type: 'text/plain' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = '生日礼物链接.txt';
+        a.click();
+        URL.revokeObjectURL(a.href);
+        showToast('链接已下载为文件');
+      };
+
+      if (preview) {
+        return <FriendPage friendName={friendName}
+                onLogout={() => setPreview(false)} />;
+      }
+
+      return (
+        <div className="page" style={{maxWidth: 720}}>
+          <div className="admin-head">
+            <h2>管理页 · 编辑礼物</h2>
+            <button className="logout" onClick={onLogout}>退出登录</button>
+          </div>
+          <div className="preview-note">当前朋友显示名：{friendName}（来自链接 ?for=）</div>
+          {gifts.map(g => (
+            <div className="admin-gift" key={g.id}>
+              <button className="ag-del" title="删除这个礼物" onClick={() => removeGift(g.id)}>×</button>
+              <div className="ag-top">
+                <label className="ag-img">
+                  {g.imageUrl ? <img src={g.imageUrl} alt="" /> : <span className="ph">上传图片</span>}
+                  <input type="file" accept="image/*" hidden onChange={e => onImg(g.id, e)} />
+                </label>
+                <div className="ag-fields">
+                  <label>商品名称</label>
+                  <input value={g.name} onChange={e => update(g.id, { name: e.target.value })} />
+                  <label>价格（仅自己可见）</label>
+                  <input type="number" value={g.price} onChange={e => update(g.id, { price: Number(e.target.value) })} />
+                </div>
+              </div>
+              <label>跳转链接（仅自己下单用，朋友看不到）</label>
+              <input value={g.linkUrl} onChange={e => update(g.id, { linkUrl: e.target.value })} />
+              <label>平台标签（仅自己可见）</label>
+              <input value={g.platformLabel} onChange={e => update(g.id, { platformLabel: e.target.value })} />
+            </div>
+          ))}
+          <button className="btn-ghost add-gift" onClick={addGift}>+ 添加礼物</button>
+          <label className="img-toggle">
+            <input type="checkbox" checked={withImages} onChange={e => setWithImages(e.target.checked)} />
+            在线短链模式下朋友自动看到图片；此开关仅用于「离线兜底链接」是否带图
+          </label>
+          <div className="admin-actions">
+            <button className="btn-primary" onClick={save}>保存修改</button>
+            <button className="btn-ghost" onClick={gen}>生成长链接</button>
+          </div>
+          <button className="btn-ghost" style={{width: '100%', marginTop: 10}} onClick={() => setPreview(true)}>预览朋友视图</button>
+          {longUrl && (
+            <div className="link-box">
+              <div className="lb-title">短链接（朋友打开即看到礼物和真实图片，微信可直接发送）</div>
+              <div className="lb-row">
+                <input readOnly value={longUrl} onFocus={e => e.target.select()} />
+                <button className="copy-btn" onClick={copy}>复制</button>
+              </div>
+              <div className="lb-hint">链接形如 …/g/xxxxxx（约 30 字符），微信直接发送；朋友打开即看到礼物和真实图片。</div>
+              <button className="btn-ghost" style={{width: '100%', marginTop: 10}} onClick={downloadLink}>下载链接为文件(.txt)</button>
+            </div>
+          )}
+          {toast && <div className="toast">{toast}</div>}
+        </div>
+      );
+    }
+
+    /* ============ 根组件 ============ */
+    function App() {
+      const [role, setRole] = useState(() => {
+        const s = localStorage.getItem(K_SESSION);
+        if (s) { try { return JSON.parse(s).role; } catch (e) {} }
+        return null;
+      });
+
+      const logout = () => { localStorage.removeItem(K_SESSION); setRole(null); };
+
+      if (!role) return <LoginPage onLogin={setRole} />;
+      if (role === 'admin') return <AdminPage onLogout={logout} />;
+      return <FriendPage friendName={getFriendName()} onLogout={logout} />;
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
