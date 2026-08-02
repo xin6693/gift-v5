@@ -177,6 +177,16 @@ const server = http.createServer(async (req, res) => {
     return sendJSON(res, 200, (sid && subsStore[sid]) ? subsStore[sid] : []);
   }
 
+  // 2.8) 清空某分享的提交记录（管理员点“清空记录”时调用）
+  if (p === '/api/clear' && req.method === 'POST') {
+    try {
+      const data = JSON.parse(await readBody(req));
+      const sid = (data.sid || u.searchParams.get('sid') || '').toString().slice(0, 32);
+      if (sid && subsStore[sid]) { delete subsStore[sid]; saveSubs(); }
+      return sendJSON(res, 200, { ok: true });
+    } catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+
   // 3) 图片文件
   if (p.startsWith('/img/')) {
     const name = path.basename(p);
