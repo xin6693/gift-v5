@@ -140,13 +140,21 @@ const server = http.createServer(async (req, res) => {
         gifts: Array.isArray(data.gifts) ? data.gifts.slice(0, 12).map(g => ({
           id: g.id,
           n: (g.n || '').toString().slice(0, 80),
-          img: (g.img || '').toString().slice(0, 2000)
+          img: (g.img || '').toString().slice(0, 100000)
         })) : [],
         createdAt: Date.now()
       };
       saveShare();
       return sendJSON(res, 200, { ok: true, sid });
     } catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+
+  // 2.5b) 读取分享（朋友打开短链时实时拉取最新商品，实现"管理员改→朋友自动同步"）
+  if (p === '/api/share' && req.method === 'GET') {
+    const sid = (u.searchParams.get('sid') || '').toString().slice(0, 32);
+    const rec = sid ? shareStore[sid] : null;
+    if (!rec) return sendJSON(res, 200, { ok: false, gifts: [] });
+    return sendJSON(res, 200, { ok: true, friendName: rec.friendName, gifts: rec.gifts });
   }
 
   // 2.6) 朋友提交选择 + 收货地址（管理员可在后台实时看到）
