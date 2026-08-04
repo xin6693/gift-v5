@@ -140,7 +140,8 @@ const server = http.createServer(async (req, res) => {
         gifts: Array.isArray(data.gifts) ? data.gifts.slice(0, 12).map(g => ({
           id: g.id,
           n: (g.n || '').toString().slice(0, 80),
-          img: (g.img || '').toString().slice(0, 100000)
+          img: (g.img || '').toString().slice(0, 100000),
+          tb: (g.tb || '').toString().slice(0, 2000)
         })) : [],
         createdAt: Date.now()
       };
@@ -166,6 +167,7 @@ const server = http.createServer(async (req, res) => {
       const rec = {
         giftId: data.giftId,
         giftName: (data.giftName || '').toString().slice(0, 80),
+        addrOnTaobao: !!(data.addrOnTaobao),
         name: (data.name || '').toString().slice(0, 40),
         phone: (data.phone || '').toString().slice(0, 20),
         region: (data.region || '').toString().slice(0, 60),
